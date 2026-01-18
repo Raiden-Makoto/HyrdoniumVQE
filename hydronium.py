@@ -1,8 +1,7 @@
 import warnings
-
+import timeit
 import pennylane as qml # type: ignore
 from pennylane import numpy as np # type: ignore
-import torch # type: ignore
 warnings.filterwarnings("ignore")
 
  # type: ignore
@@ -39,9 +38,6 @@ coeffs, obs = H.terms()
 print(f"Using {qubits} qubits to encode the hydronium ion.")
 print(f"Molecular Hamiltonian has {len(obs)} operators.")
 
-hf_energy = qml.qchem.hf_energy(molecule)
-print(hf_energy())
-
 H_sparse = qml.SparseHamiltonian(H.sparse_matrix(), wires=range(qubits))
 dev = qml.device("lightning.qubit", wires=qubits)
 
@@ -55,96 +51,154 @@ print(f"Operator Pool Size: {len(operator_pool)}")
 dev = qml.device("lightning.qubit", wires=range(qubits))
 
 # Storage for the circuit we are building
-current_ops = []     # List of selected excitations (wires)
-current_params = []  # List of current optimal angles
+current_ops = []     
+current_params = []  
 
-# --- 2. HELPER: The Circuit Builder ---
-def circuit(params, ops_list):
+best_energy = float('inf')
+best_params = []
+best_ops = []
+
+# --- 2. ENERGY FUNCTION (For the 'Optimization' phase) ---
+@qml.qnode(dev, diff_method="adjoint")
+def energy_fn(params):
     qml.BasisState(hf_state, wires=range(qubits))
     
-    # Apply selected operators in order
-    for i, op_wires in enumerate(ops_list):
-        # We use SingleExcitation/DoubleExcitation dynamically
+    # Apply the grown circuit
+    for i, op_wires in enumerate(current_ops):
         if len(op_wires) == 2:
             qml.SingleExcitation(params[i], wires=op_wires)
         elif len(op_wires) == 4:
             qml.DoubleExcitation(params[i], wires=op_wires)
-
-@qml.qnode(dev, diff_method="adjoint")
-def energy_fn(params):
-    circuit(params, current_ops)
+            
     return qml.expval(H_sparse)
 
-# --- 3. HELPER: The Gradient Checker (The "Scanner") ---
-# Calculates the gradient of adding ONE candidate gate (with angle=0)
+start_time = timeit.default_timer()
+# --- 3. THE SPEED TRICK: Vectorized Gradient Scanner ---
+# Calculates gradients for ALL 350 pool candidates in ONE execution
 @qml.qnode(dev, diff_method="adjoint")
-def gradient_scanner(params_existing, candidate_wires):
+def super_gradient_circuit(pool_params, fixed_params):
     qml.BasisState(hf_state, wires=range(qubits))
     
-    # 1. Apply existing circuit (fixed)
-    for i, op_wires in enumerate(current_ops):
-        if len(op_wires) == 2:
-            qml.SingleExcitation(params_existing[i], wires=op_wires)
-        elif len(op_wires) == 4:
-            qml.DoubleExcitation(params_existing[i], wires=op_wires)
+    # A. Apply the EXISTING circuit (Fixed - these don't change during scan)
+    for i, wires in enumerate(current_ops):
+        if len(wires) == 2:
+            qml.SingleExcitation(fixed_params[i], wires=wires)
+        elif len(wires) == 4:
+            qml.DoubleExcitation(fixed_params[i], wires=wires)
             
-    # 2. Apply the CANDIDATE gate with parameter 0.0
-    # We want the gradient of THIS gate at 0.0
-    # (Note: In PennyLane, we must pass it as a tracked variable to get grad)
-    theta = np.array(0.0, requires_grad=True)
-    if len(candidate_wires) == 2:
-        qml.SingleExcitation(theta, wires=candidate_wires)
-    elif len(candidate_wires) == 4:
-        qml.DoubleExcitation(theta, wires=candidate_wires)
+    # B. Apply the ENTIRE POOL (Candidates)
+    # We apply all 350 gates with parameters 'pool_params'
+    # We will pass 0.0 for all of them. The gradient will tell us 
+    # "How much does the energy drop if I turn this gate on?"
+    for i, wires in enumerate(operator_pool):
+        if len(wires) == 2:
+            qml.SingleExcitation(pool_params[i], wires=wires)
+        elif len(wires) == 4:
+            qml.DoubleExcitation(pool_params[i], wires=wires)
+            
     return qml.expval(H_sparse)
+end_time = timeit.default_timer()
+print(f"Time taken to calculate the gradient: {end_time - start_time} seconds")
+# --- 4. THE FAST LOOP ---
 
-# --- 4. THE MAIN ADAPT-VQE LOOP ---
-max_steps = 20
-threshold = 1e-4 # Stop if no gradient is larger than this
+max_steps = 50
+threshold = 5e-5
 
-print(f"--- Starting ADAPT-VQE ---")
-print(f"Goal: Grow a circuit that beats -76.266 Ha")
+print(f"--- Starting Fast ADAPT-VQE ---")
+print(f"Goal: < -76.30 Ha")
 
 for step in range(max_steps):
-    print(f"\nStep {step+1}: Scanning pool...")
+    print(f"\nStep {step+1}: Scanning pool...", end="")
     
-    # Scan the pool (Find the "Most Wanted" Gate)
-    gradients = []
+    # 1. PREPARE INPUTS
+    # We want gradients at zero for the pool
+    pool_zeros = np.zeros(len(operator_pool), requires_grad=True)
+    # The current circuit params are fixed during the scan
+    fixed_params = np.array(current_params, requires_grad=False)
     
-    for candidate in operator_pool:
-        # Check gradient of adding this candidate
-        # We wrap it in qml.grad to get the derivative w.r.t the new angle 'theta'
-        g = qml.grad(gradient_scanner)(np.array(current_params), candidate)
-        gradients.append(abs(g))
+    # 2. THE ONE-SHOT GRADIENT CALCULATION
+    # This runs ONCE instead of 350 times
+    grads = qml.grad(super_gradient_circuit, argnum=0)(pool_zeros, fixed_params)
     
-    # Select the Best
-    best_idx = np.argmax(gradients)
-    max_grad = gradients[best_idx]
+    # 3. SELECT THE WINNER
+    best_idx = np.argmax(abs(grads))
+    max_grad = abs(grads[best_idx])
+    
+    print(f" Done. Max Grad: {max_grad:.5f}")
     
     if max_grad < threshold:
-        print(f"--> Convergence! Max gradient ({max_grad:.1e}) < Threshold.")
+        print(f"--> Convergence! No more operators needed.")
         break
-        
+    
     selected_op = operator_pool[best_idx]
-    print(f"  Selected: {selected_op} (Grad: {max_grad:.5f})")
+    print(f"  Adding Op: {selected_op}")
     
-    # Grow the Circuit
+    # 4. GROW & OPTIMIZE
     current_ops.append(selected_op)
-    current_params.append(0.0) # Initialize new param at 0
+    current_params.append(0.0)
     
-    # Optimize the NEW Circuit (Retrain everything)
-    # The new parameter needs to be optimized along with the old ones
+    # Retrain the new circuit
+    # (Since it's only growing by 1 gate at a time, this is fast)
     opt = qml.AdamOptimizer(stepsize=0.05)
     params_tensor = np.array(current_params, requires_grad=True)
     
     for k in range(30):
         params_tensor, E = opt.step_and_cost(energy_fn, params_tensor)
-    
+        
     current_params = params_tensor.tolist()
-    print(f"  New Energy: {E:.6f} Ha")
-    if E < -76.28:
+    print(f"  Current Energy: {E:.6f} Ha")
+    
+    if E < best_energy:
+        best_energy = E
+        # need to copy the params and ops to avoid reference issues
+        best_params = current_params.copy()
+        best_ops = current_ops.copy()
+        
+    if E < -76.30:
         print("  --> STRONG correlation captured!")
-
+        
 print("-" * 30)
-print(f"Final Circuit Depth: {len(current_ops)} gates")
-print(f"Final Energy: {E:.6f} Ha")
+print(f"Best Energy: {best_energy:.6f} Ha")
+print(f"Circuit Depth: {len(best_ops)}")
+
+core_indices = [0]
+active_indices = [1, 2, 3, 4, 5, 6, 7, 8]
+
+print("Building Dipole Operators...")
+# This returns a list of 3 Observables: [D_x, D_y, D_z]
+dipole_func = qml.qchem.dipole_moment(
+    molecule, 
+    core=core_indices, 
+    active=active_indices,
+    mapping='jordan_wigner'
+)
+
+dipole_obs = dipole_func()
+
+# --- 2. MEASURE FUNCTION ---
+@qml.qnode(dev, diff_method="adjoint")
+def measure_dipole(params):
+    qml.BasisState(hf_state, wires=range(qubits))
+    
+    # Reconstruct your optimized ADAPT-VQE circuit
+    for i, op_wires in enumerate(best_ops):
+        if len(op_wires) == 2:
+            qml.SingleExcitation(params[i], wires=op_wires)
+        elif len(op_wires) == 4:
+            qml.DoubleExcitation(params[i], wires=op_wires)
+            
+    # Measure all 3 components at once
+    return [qml.expval(dipole_obs[0]), 
+            qml.expval(dipole_obs[1]), 
+            qml.expval(dipole_obs[2])]
+
+# --- 3. EXECUTE ---
+# Use the parameters from your BEST step (Step 20 is likely safer than Step 40)
+# If you want to use the current state, just pass 'current_params'
+dx, dy, dz = measure_dipole(best_params)
+
+total_dipole = np.sqrt(dx**2 + dy**2 + dz**2)
+
+print(f"\n--- Final Results ---")
+print(f"Dipole Vector (X, Y, Z): [{dx:.4f}, {dy:.4f}, {dz:.4f}]")
+print(f"Total Dipole Moment:     {total_dipole:.4f} Debye")

@@ -225,33 +225,40 @@ print(f"Dipole Vector (X, Y, Z): [{dx:.4f}, {dy:.4f}, {dz:.4f}]")
 print(f"Total Dipole Moment:     {total_dipole:.4f} Debye")
 
 
-# --- 5. POTENTIAL ENERGY SURFACE (PES) SCAN ---
+# --- 5. POTENTIAL ENERGY SURFACE (PES) SCAN (ROBUST) ---
 
 print("\n" + "="*40)
-print("Starting Transfer Learning PES Scan")
+print("Starting Robust PES Scan (Hub-and-Spoke)")
+print("Strategy: Always reset to 'best_params' for each point.")
 print("="*40)
 
-scales = [0.95, 0.975, 1.00, 1.025, 1.05] 
+# Wide range to capture the full "U" shape
+scales = [0.80, 0.90, 1.00, 1.10, 1.20] 
 energies = []
-current_guess_params = np.array(best_params, requires_grad=True)
 
 for scale in scales:
     print(f"Scanning scale {scale:.3f} ... ", end="")
+    
+    # 1. Update Geometry
     new_coords = base_coords * scale
     
+    # 2. Rebuild Hamiltonian
     mol_scan = qml.qchem.Molecule(
         symbols, new_coords, charge=1, mult=1,
-        basis_name='6-31G', name='hydronium_scan'
+        basis_name='6-31G', name=f'hydronium_{scale:.2f}',
+        unit='angstrom'
     )
     H_scan, _ = qml.qchem.molecular_hamiltonian(
         mol_scan, mapping='jordan_wigner', method='pyscf',
-        active_electrons=8, active_orbitals=8
+        active_electrons=8, active_orbitals=8,
     )
     H_scan_sparse = qml.SparseHamiltonian(H_scan.sparse_matrix(), wires=range(qubits))
 
+    # 3. Define Cost Function
     @qml.qnode(dev, diff_method="adjoint")
     def scan_cost_fn(params):
         qml.BasisState(hf_state, wires=range(qubits))
+        # Reuse 'best_ops' structure
         for i, op_wires in enumerate(best_ops):
             if len(op_wires) == 2:
                 qml.SingleExcitation(params[i], wires=op_wires)
@@ -259,23 +266,34 @@ for scale in scales:
                 qml.DoubleExcitation(params[i], wires=op_wires)
         return qml.expval(H_scan_sparse)
 
+    # 4. CRITICAL FIX: Always restart from the BEST known parameters
+    # This prevents "bad" results from 0.8 contaminating the 1.0 run.
+    current_guess_params = np.array(best_params, requires_grad=True)
+    
     opt = qml.AdamOptimizer(stepsize=0.05)
-    params_tensor = np.array(current_guess_params, requires_grad=True)
     local_min_E = 100.0
     
-    for k in range(20):
-        params_tensor, E = opt.step_and_cost(scan_cost_fn, params_tensor)
-        if E < local_min_E: local_min_E = E
+    # Run optimization for this point
+    for k in range(30): # Increased to 30 steps to ensure convergence
+        current_guess_params, E = opt.step_and_cost(scan_cost_fn, current_guess_params)
+        if E < local_min_E: 
+            local_min_E = E
             
     energies.append(local_min_E)
-    current_guess_params = params_tensor
     print(f"Energy: {local_min_E:.6f} Ha")
 
 # --- 6. PLOT ---
 try:
+    import matplotlib.pyplot as plt
     plt.figure(figsize=(8, 6))
-    plt.plot(scales, energies, 'ro-', markersize=8, linewidth=2, label='ADAPT-VQE')
-    plt.title(f'PES: Hydronium ({len(best_ops)} gates)')
+    plt.plot(scales, energies, 'bo-', markersize=8, linewidth=2, label='ADAPT-VQE')
+    
+    # Add a marker for the minimum
+    min_energy = min(energies)
+    min_scale = scales[np.argmin(energies)]
+    plt.plot(min_scale, min_energy, 'r*', markersize=15, label=f'Min ({min_scale:.2f})')
+    
+    plt.title(f'PES: Hydronium Dissociation ({len(best_ops)} gates)')
     plt.xlabel('Bond Length Scale')
     plt.ylabel('Energy (Ha)')
     plt.grid(True, linestyle='--', alpha=0.7)

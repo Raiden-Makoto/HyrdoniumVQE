@@ -9,10 +9,7 @@ import matplotlib.pyplot as plt # type: ignore
 # Suppress warnings
 warnings.filterwarnings("ignore")
 
-print("--- 1. MOLECULE SETUP ---")
-
 symbols = ['O', 'H', 'H', 'H']
-# Equilibrium coordinates (Angstroms)
 base_coords = np.array([
     [ 0.000000,  0.000000,  0.128500],  # Oxygen (Top of pyramid)
     [ 0.000000,  0.937600, -0.165400],  # H1
@@ -30,8 +27,6 @@ molecule = qml.qchem.Molecule(
     unit='angstrom'
 )
 
-# Active Space: 8 electrons, 8 spatial orbitals
-# (Frozen Core: Oxygen 1s)
 H, qubits = qml.qchem.molecular_hamiltonian(
     molecule,
     mapping='jordan_wigner',
@@ -47,21 +42,16 @@ hf_state = qml.qchem.hf_state(8, qubits)
 print(f"System: {qubits} qubits")
 print(f"Hartree-Fock state: {hf_state}")
 
-# Build Operator Pool (Singles + Doubles)
 singles, doubles = qml.qchem.excitations(8, qubits)
 operator_pool = doubles + singles 
 
-# --- GLOBAL STORAGE FOR ANSATZ ---
 current_ops = []     
 current_params = []  
 best_energy = float('inf')
 best_params = []
 best_ops = []
 
-# CHECKPOINT FILE NAME
 CHECKPOINT_FILE = "hydronium_checkpoint.json"
-
-# --- 2. CORE QUANTUM FUNCTIONS ---
 
 @qml.qnode(dev, diff_method="adjoint")
 def energy_fn(params):
@@ -76,13 +66,11 @@ def energy_fn(params):
 @qml.qnode(dev, diff_method="adjoint")
 def super_gradient_circuit(pool_params, fixed_params):
     qml.BasisState(hf_state, wires=range(qubits))
-    # A. Existing
     for i, wires in enumerate(current_ops):
         if len(wires) == 2:
             qml.SingleExcitation(fixed_params[i], wires=wires)
         elif len(wires) == 4:
             qml.DoubleExcitation(fixed_params[i], wires=wires)
-    # B. Pool
     for i, wires in enumerate(operator_pool):
         if len(wires) == 2:
             qml.SingleExcitation(pool_params[i], wires=wires)
@@ -91,9 +79,6 @@ def super_gradient_circuit(pool_params, fixed_params):
     return qml.expval(H_sparse)
 
 
-# --- 3. SMART TRAINING LOGIC ---
-
-# Check if we already have a trained model
 if os.path.exists(CHECKPOINT_FILE):
     print(f"\n[INFO] Found checkpoint file: {CHECKPOINT_FILE}")
     print("Loading saved parameters (Skipping Training)...")
@@ -107,18 +92,14 @@ if os.path.exists(CHECKPOINT_FILE):
     print(f"Loaded Circuit Depth: {len(best_ops)}")
     print(f"Loaded Best Energy:   {best_energy:.6f} Ha")
     
-    # Set current globals to match loaded state (for consistency)
     current_ops = best_ops
     current_params = best_params
 
 else:
-    # --- RUN FULL TRAINING ---
     max_steps = 40
     threshold = 5e-5
 
     print(f"\n--- Starting Fast ADAPT-VQE ---")
-    print(f"Goal: < -76.30 Ha")
-
     start_time = timeit.default_timer()
 
     for step in range(max_steps):
@@ -139,22 +120,18 @@ else:
             break
         
         selected_op = operator_pool[best_idx]
-        # JSON Warning: PennyLane wires might be numpy ints, convert to standard int
         selected_op = [int(w) for w in selected_op] 
         print(f"  Adding Op: {selected_op}")
-        
-        # 3. GROW
+
         current_ops.append(selected_op)
         current_params.append(0.0)
         
-        # 4. OPTIMIZE
         opt = qml.AdamOptimizer(stepsize=0.05)
         params_tensor = np.array(current_params, requires_grad=True)
         
         for k in range(30):
             params_tensor, E = opt.step_and_cost(energy_fn, params_tensor)
             
-            # Save Snapshot
             if E < best_energy:
                 best_energy = E
                 best_params = params_tensor.copy().tolist()
@@ -170,10 +147,8 @@ else:
     print("-" * 30)
     print(f"ADAPT-VQE Complete in {end_time - start_time:.1f}s")
     
-    # --- SAVE CHECKPOINT ---
     print(f"\n[INFO] Saving model to {CHECKPOINT_FILE}...")
     
-    # Ensure lists are clean for JSON (no numpy types)
     save_data = {
         "ops": best_ops,
         "params": best_params,
@@ -185,17 +160,13 @@ else:
     print("Save successful.")
 
 
-# --- 4. PHYSICAL PROPERTIES (Dipole Moment) ---
-
 print("\n--- Physical Properties ---")
 
-# Ensure consistency
 best_ops = best_ops[:len(best_params)]
 
 core_indices = [0]
 active_indices = [1, 2, 3, 4, 5, 6, 7, 8]
 
-# 1. Get Generator
 dipole_func = qml.qchem.dipole_moment(
     molecule, 
     core=core_indices, 
@@ -203,7 +174,6 @@ dipole_func = qml.qchem.dipole_moment(
     mapping='jordan_wigner'
 )
 
-# 2. Get Operators
 dipole_obs = dipole_func()
 
 @qml.qnode(dev, diff_method="adjoint")
@@ -225,24 +195,18 @@ print(f"Dipole Vector (X, Y, Z): [{dx:.4f}, {dy:.4f}, {dz:.4f}]")
 print(f"Total Dipole Moment:     {total_dipole:.4f} Debye")
 
 
-# --- 5. POTENTIAL ENERGY SURFACE (PES) SCAN (ROBUST) ---
-
 print("\n" + "="*40)
-print("Starting Robust PES Scan (Hub-and-Spoke)")
-print("Strategy: Always reset to 'best_params' for each point.")
+print("Starting PES Scan...")
 print("="*40)
 
-# Wide range to capture the full "U" shape
 scales = [0.80, 0.90, 1.00, 1.10, 1.20] 
 energies = []
 
 for scale in scales:
     print(f"Scanning scale {scale:.3f} ... ", end="")
     
-    # 1. Update Geometry
     new_coords = base_coords * scale
     
-    # 2. Rebuild Hamiltonian
     mol_scan = qml.qchem.Molecule(
         symbols, new_coords, charge=1, mult=1,
         basis_name='6-31G', name=f'hydronium_{scale:.2f}',
@@ -254,11 +218,9 @@ for scale in scales:
     )
     H_scan_sparse = qml.SparseHamiltonian(H_scan.sparse_matrix(), wires=range(qubits))
 
-    # 3. Define Cost Function
     @qml.qnode(dev, diff_method="adjoint")
     def scan_cost_fn(params):
         qml.BasisState(hf_state, wires=range(qubits))
-        # Reuse 'best_ops' structure
         for i, op_wires in enumerate(best_ops):
             if len(op_wires) == 2:
                 qml.SingleExcitation(params[i], wires=op_wires)
@@ -266,15 +228,12 @@ for scale in scales:
                 qml.DoubleExcitation(params[i], wires=op_wires)
         return qml.expval(H_scan_sparse)
 
-    # 4. CRITICAL FIX: Always restart from the BEST known parameters
-    # This prevents "bad" results from 0.8 contaminating the 1.0 run.
     current_guess_params = np.array(best_params, requires_grad=True)
     
     opt = qml.AdamOptimizer(stepsize=0.05)
     local_min_E = 100.0
     
-    # Run optimization for this point
-    for k in range(30): # Increased to 30 steps to ensure convergence
+    for k in range(30):
         current_guess_params, E = opt.step_and_cost(scan_cost_fn, current_guess_params)
         if E < local_min_E: 
             local_min_E = E
@@ -282,13 +241,11 @@ for scale in scales:
     energies.append(local_min_E)
     print(f"Energy: {local_min_E:.6f} Ha")
 
-# --- 6. PLOT ---
 try:
-    import matplotlib.pyplot as plt
+    import matplotlib.pyplot as plt # type: ignore
     plt.figure(figsize=(8, 6))
     plt.plot(scales, energies, 'bo-', markersize=8, linewidth=2, label='ADAPT-VQE')
     
-    # Add a marker for the minimum
     min_energy = min(energies)
     min_scale = scales[np.argmin(energies)]
     plt.plot(min_scale, min_energy, 'r*', markersize=15, label=f'Min ({min_scale:.2f})')
